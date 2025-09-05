@@ -1,4 +1,5 @@
 #include <json-c/json_object.h>
+#include <json-c/json_util.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <stddef.h>
@@ -16,9 +17,9 @@ typedef struct Attribute {
 typedef struct HTMLTag {
     char *name;
     char *content;
-    struct Attribute *attributes;
+    struct Attribute **attributes; // array of pointers to attributes
     struct HTMLTag *parent;
-    struct HTMLTag *children;
+    struct HTMLTag **children; // array of pointers to nested tags
     int children_length;
     int attribute_length;
 } HTMLTag;
@@ -79,12 +80,12 @@ HTMLTag *create_tag_from_string(const char *name, const char *content);
 HTMLTag *next_tag(char **line_ptr);
 
 /* Adding HTMLTags/Attributes */
-void add_child(HTMLTag *parent, HTMLTag child);
-void add_attribute(HTMLTag *token, Attribute attr);
+void add_child(HTMLTag *parent, HTMLTag *child);
+void add_attribute(HTMLTag *tag, Attribute *attr);
 HTMLTag *parse_tags(FILE *stream);
 
 /* JSON */
-json_object *json_create_attributes_array(Attribute *attrs, int attrs_length);
+json_object *json_create_attributes_array(Attribute **attrs, int attrs_length);
 json_object *json_create_tag(HTMLTag *tag);
 void json_traverse_children_and_create_tags(HTMLTag *root, json_object *json_root, json_object *root_children);
 
@@ -143,7 +144,6 @@ bool is_valid_tag(HTMLTag *tag) {
     if (tag->name[0] == '/') {
         // Newly allocated string
         tmp_tag = remove_chr(tag->name, '/');
-        printf("Newly allocated tmp tag: %s\n", tmp_tag);
         needs_freeing = true;
     }
     else {
@@ -169,9 +169,6 @@ bool open_close_tags_match(char *open_tag, char *close_tag) {
     bool match = false;
     char *new_close_tag = remove_chr(close_tag, '/');
 
-    printf("Open tag: %s\n", open_tag);
-    printf("Close tag with removed char: %s\n", new_close_tag);
-    
     if (strcmp(open_tag, new_close_tag) == 0)
         match = true;
 
@@ -223,7 +220,7 @@ char *remove_chr(char *str, int c) {
 }
 
 /*
- * Returns true if a given string is in array, otherwise false
+ * Returns true if a given string is present in array, otherwise false
  */
 bool str_in_arr(char *str, char *arr[], int arr_len) {
     for (int i = 0; i < arr_len; i++) {
@@ -242,9 +239,7 @@ bool str_in_arr(char *str, char *arr[], int arr_len) {
  */
 char *get_tag_type(HTMLTag *tag) {
     if (is_valid_tag(tag)) {
-        printf("VALID TAG: %s\n", tag->name);
         if (str_in_arr(tag->name, non_closing_tags, NON_CLOSING_TAGS_LEN)) {
-            printf("NON CLOSING TYPE\n");
             return "non_closing";
         }
         if (tag->name[0] == '/') {
@@ -265,13 +260,15 @@ char *get_tag_type(HTMLTag *tag) {
  */
 void print_all_tags(HTMLTag *root, int padding) {
     printf("<%s>\n", root->name);
+
     for (int i = 0; i < root->children_length; i++) {
         for (int j = 0; j < padding; j++) {
             putchar(' ');
         }
-        HTMLTag *child = root->children + i;
 
-        if (child->children) {
+        HTMLTag *child = *(root->children + i);
+
+        if (child->children_length > 0) {
             print_all_tags(child, padding + 2);
         }
         else {
@@ -281,34 +278,43 @@ void print_all_tags(HTMLTag *root, int padding) {
 }
 
 /*
- * Prints all parsed tags with padding
+ * Frees memory of a given HTMLTag and all its children
  */
 void free_tag(HTMLTag *root) {
-    for (int i = 0; i < root->children_length; i++) {
-        HTMLTag *child = root->children + i;
+    printf("Freeing <%s>\n", root->name);
 
-        if (child->children) {
-            free_tag(child);
-        }
+    // Free children tags
+    for (int i = 0; i < root->children_length; i++) {
+        HTMLTag *child = *(root->children + i);
+        free_tag(child);
     }
 
+    // Free attributes
     for (int i = 0; i < root->attribute_length; i++) {
-        Attribute *attr = root->attributes + i;
+        Attribute *attr = *(root->attributes + i);
         free(attr->name);
         free(attr->value);
+        free(attr);
     }
 
+    // Free the pointer to attributes
     if (root->attributes != NULL)
         free(root->attributes);
 
+    // Free tag name
     if (root->name != NULL)
         free(root->name);
 
+    // Free tag content
     if (root->content != NULL)
         free(root->content);
 
+    // Free the pointer to children tags
     if (root->children != NULL)
         free(root->children);
+
+    // Free the pointer to HTMLTag struct
+    free(root);
 }
 
 /* 
@@ -333,7 +339,7 @@ FILE *open_file() {
 char *readline(FILE *fp) {
     int offset = 0;
     int bufsize = 4;
-    char *buf = (char*) malloc(bufsize);
+    char *buf = (char*) calloc(bufsize, sizeof(char));
     int c;
 
     if (buf == NULL) {
@@ -368,6 +374,7 @@ char *readline(FILE *fp) {
 
     // Adjusting buffer size to fit the string
     if (offset < bufsize - 1) {
+        // Zero characters read
         if (offset == 0) {
             free(buf);
             return NULL;
@@ -390,54 +397,41 @@ char *readline(FILE *fp) {
 
 
 /* 
- * Allocates memory for an Attribute struct, initializes its fields, and returns it 
+ * Allocates memory for an Attribute struct, initializes its fields, and returns a pointer to it 
  */
 Attribute *create_attribute(const char *name, const char *value) {
-    Attribute *attr = malloc(sizeof(Attribute));
-
-    int name_length = strlength(name) + 1; // +1 for null terminator
-    attr->name = (char*) malloc(sizeof(char) * name_length);
-    strcpy(attr->name, name);
-
-    int value_length = strlength(value) + 1; // +1 for null terminator
-    attr->value = (char*) malloc(sizeof(char) * value_length);
-    strcpy(attr->value, value);
-
+    Attribute *attr = calloc(1, sizeof(Attribute));
+    attr->name = strdup(name);
+    attr->value = strdup(value);
     return attr;
 }
 
 /* 
- * Allocates memory for a HTMLTag struct, initializes its fields, and returns it 
+ * Allocates memory for a HTMLTag struct, initializes its fields, and returns a pointer to it 
  */
 HTMLTag *create_tag_from_string(const char *name, const char *content) {
     HTMLTag *tag = (HTMLTag*) calloc(1, sizeof(HTMLTag));
-
-    // TODO: See if there's a shortcut for memory allocation and string copying
     
-    // Allocating tag name and copying string "name" to it
-    int tag_name_length = strlength(name) + 1; // +1 for null terminator
-    tag->name = (char*) malloc(sizeof(char) * tag_name_length);
+    if (name == NULL) {
+        printf("Cannot create HTML tag without a name\n");
+        exit(1);
+    }
 
-    if (strcpy(tag->name, name) == NULL) {
-        free(tag->name);
+    // Copy string name to tag's name
+    tag->name = strdup(name);
+    if (tag->name == NULL) {
         printf("Failed to copy string '%s' to tag name\n", name);
         exit(1);
     }
 
-    // Allocating tag content and copying string "content" to it
     if (content != NULL) {
-        int tag_content_length = strlength(content) + 1; // +1 for null terminator
-        tag->content = (char*) malloc(sizeof(char) * tag_content_length);
-
-        if (strcpy(tag->content, content) == NULL) {
-            free(tag->content);
+        // Copy string content to tag's content
+        tag->content = strdup(content);
+        if (tag->content == NULL) {
             printf("Failed to copy string '%s' to tag content\n", content);
             exit(1);
         }
-
-        printf("Copied tag content: %s\n", tag->content);
     }
-
 
     return tag;
 }
@@ -445,28 +439,28 @@ HTMLTag *create_tag_from_string(const char *name, const char *content) {
 /* 
  * Dynamically adds child tag to the parent tag 
  */
-void add_child(HTMLTag *parent, HTMLTag child) {
+void add_child(HTMLTag *parent, HTMLTag *child) {
+    if (parent == NULL || child == NULL) return;
+
     if (parent->children_length == 0) {
-        parent->children = (HTMLTag*) malloc(sizeof(HTMLTag));
+        parent->children_length++;
+        parent->children = (HTMLTag**) malloc(sizeof(HTMLTag*));
 
         if (parent->children == NULL) {
             free(parent->children);
-            perror("Failed to allocate memory for children HTMLTag");
+            printf("Failed to allocate memory for children HTMLTag\n");
             exit(1);
         }
 
-        *(parent->children + parent->children_length) = child;
-        parent->children_length++;
+        *(parent->children + parent->children_length - 1) = child;
     }
     else {
         parent->children_length++;
-        printf("First child: %s\n", (*(parent->children)).name);
-        printf("Parent children length: %d\n", parent->children_length);
-        HTMLTag *new_children_ptr = (HTMLTag*) realloc(parent->children, sizeof(HTMLTag) * parent->children_length);
+        HTMLTag **new_children_ptr = (HTMLTag**) realloc(parent->children, sizeof(HTMLTag*) * parent->children_length);
 
         if (new_children_ptr == NULL) {
             free(new_children_ptr);
-            perror("Failed to reallocate memory for children HTMLTags");
+            printf("Failed to reallocate memory for children HTMLTags\n");
             exit(1);
         }
 
@@ -478,9 +472,11 @@ void add_child(HTMLTag *parent, HTMLTag child) {
 /* 
  * Dynamically adds an attribute to the tag 
  */
-void add_attribute(HTMLTag *tag, Attribute attr) {
+void add_attribute(HTMLTag *tag, Attribute *attr) {
+    if (tag == NULL || attr == NULL) return;
+
     if (tag->attribute_length == 0) {
-        tag->attributes = (Attribute*) malloc(sizeof(Attribute));
+        tag->attributes = (Attribute**) malloc(sizeof(Attribute*));
 
         if (tag->attributes == NULL) {
             free(tag->attributes);
@@ -493,7 +489,7 @@ void add_attribute(HTMLTag *tag, Attribute attr) {
     }
     else {
         tag->attribute_length++;
-        Attribute *new_attr_ptr = (Attribute*) realloc(tag->attributes, sizeof(Attribute) * tag->attribute_length);
+        Attribute **new_attr_ptr = (Attribute**) realloc(tag->attributes, sizeof(Attribute*) * tag->attribute_length);
 
         if (new_attr_ptr == NULL) {
             free(new_attr_ptr);
@@ -505,7 +501,6 @@ void add_attribute(HTMLTag *tag, Attribute attr) {
         *(tag->attributes + tag->attribute_length - 1) = attr;
     }
 }
-
 
 /* 
  * Searches for the next tag in a line pointed to by line_ptr 
@@ -526,25 +521,43 @@ HTMLTag *next_tag(char **line_ptr) {
     char *tag_name = (char*) calloc(128, sizeof(char));
     char *tag_content = (char*) calloc(1024, sizeof(char));
 
-    char *line = *line_ptr; // To be able to mutate the pointer to the line we need to modify the pointer to the pointer to the line
+    char *line = *line_ptr; // To be able to mutate the pointer to the line we need to modify a pointer to the pointer to the line
     bool error_exit = false;
     int offset = 0;
 
     // Character at which is pointing the line pointer
     int chr;
 
-    printf("Expected: %s\n", expected_token);
     printf("Current line: %s\n", line);
+    printf("Expected: %s\n", expected_token);
 
     // TODO: Maybe replace this implementation with regexes
     while ((chr = *line), chr != EOF && chr != '\n') {
+        // We parse tags character by character following the chain of expected tokens:
+        //   
+        //   
+        //             attr_value_open     attr_separator_or_close_tag
+        //     open_tag    |                         |
+        //       |         |                         |\ 
+        //       v         v\                        vv
+        //       <div class="text-red-400 text-center">
+        //        ^  ^^                ^
+        //        |  |/                 |
+        //        |  |                  |
+        //        | attr_name           |
+        //        |                     |
+        //      tag_name                |
+        //                          attr_value
+        //   
+        //
+        //
+        
         if (COMMENT_OPENED) {
             // -->\n
             if (chr == '-') {
                 if (strlength(line) >= 3) {
                     if (*(line + 1) == '-' && *(line + 2) == '>') {
                         printf("Comment closed\n");
-                        printf("Line length: %d\n", (int) strlength(line));
                         COMMENT_OPENED = false;
                         expected_token = "open_tag";
                         line += 3;
@@ -587,7 +600,7 @@ HTMLTag *next_tag(char **line_ptr) {
             else if (chr == ' ' && strlength(tag_name) > 0) {
                 // TODO: In here we know for sure it's an opening tag.
                 // If tag_content isn't empty, means that it's arbitrary text
-                // that belongs to newly created tag's parent. Shadow text tag
+                // that belongs to this tag's parent. Shadow text tag
                 tag = create_tag_from_string(tag_name, NULL);
                 expected_token = "attr_name";
                 offset = 0;
@@ -598,18 +611,20 @@ HTMLTag *next_tag(char **line_ptr) {
             else if (chr == '!') {
                 // !--
                 printf("Comment opened\n");
-                printf("Line length: %d\n", (int) strlength(line));
-
                 if (strlength(line) >= 3) {
                     if (*(line + 1) == '-' && *(line + 2) == '-') {
                         COMMENT_OPENED = true;
                         line += 3;
                         continue;
                     }
+                    else
+                        error_exit = true;
                 }
-                else {
-                    printf("Invalid comment syntax.");
+                else
                     error_exit = true;
+
+                if (error_exit) {
+                    printf("Invalid comment syntax.\n");
                     break;
                 }
             }
@@ -623,6 +638,7 @@ HTMLTag *next_tag(char **line_ptr) {
             if (isalpha(chr)) {
                 attr_name[offset++] = chr;
             }
+            // Attribute value separator
             else if (chr == '=' && strlength(attr_name) > 0) {
                 expected_token = "attr_value_open";
                 offset = 0;
@@ -647,7 +663,6 @@ HTMLTag *next_tag(char **line_ptr) {
             }
         }
         else if (strequals(expected_token, "attr_value")) {
-            // TODO: Add "_", "-" to allowed characters
             if (isalnum(chr) || char_in(VALID_ATTR_SPECIAL_CHARS, chr)) {
                 attr_value[offset++] = chr;
             }
@@ -657,21 +672,20 @@ HTMLTag *next_tag(char **line_ptr) {
 
                 // Add attr to HTMLTag
                 attr = create_attribute(attr_name, attr_value);
-                add_attribute(tag, *attr);
+                add_attribute(tag, attr);
 
                 printf("Expected: %s\n", expected_token);
 
-                free(attr);
                 free(attr_name);
                 free(attr_value);
 
                 // Reset pointers to null so that we know we don't need to free them anymore
+                // We don't free attr because it's a pointer that's now attached to the tag
                 attr = NULL;
                 attr_name = NULL;
                 attr_value = NULL;
             }
             else {
-                printf("Got char: %c\n", chr);
                 error_exit = true;
                 printf("Expected %s: Bad tag.\n", expected_token);
                 break;
@@ -682,8 +696,8 @@ HTMLTag *next_tag(char **line_ptr) {
                 expected_token = "attr_name";
 
                 // Reallocate freed pointers
-                attr_name = (char*) calloc(100, sizeof(char));
-                attr_value = (char*) calloc(100, sizeof(char));
+                attr_name = (char*) calloc(128, sizeof(char));
+                attr_value = (char*) calloc(128, sizeof(char));
 
                 printf("Expected: %s\n", expected_token);
             }
@@ -704,11 +718,6 @@ HTMLTag *next_tag(char **line_ptr) {
     }
 
     // Free all allocated pointers
-    if (attr) {
-        free(attr->name);
-        free(attr->value);
-        free(attr);
-    }
     if (attr_name) free(attr_name);
     if (attr_value) free(attr_value);
     if (tag_name) free(tag_name);
@@ -746,17 +755,13 @@ HTMLTag *parse_tags(FILE *stream) {
             // TODO: Create a function that will free current_tag and all its children
             HTMLTag *tag = next_tag(&line);
 
-            if (!tag) {
-                free(tag);
-                printf("TAG WAS NULL\n");
+            if (tag == NULL) {
                 break;
             }
             // Root opening tag
             else if (!current_tag && is_opening_tag(tag)) {
                 printf("Found opening tag\n");
-                printf("%s\n", tag->name);
-                current_tag = (HTMLTag*) calloc(1, sizeof(HTMLTag));
-                *current_tag = *tag;
+                current_tag = tag;
             }
             // Closing tag without opening
             else if (!current_tag && is_closing_tag(tag)) {
@@ -766,15 +771,14 @@ HTMLTag *parse_tags(FILE *stream) {
             }
             // Nested opening tag
             else if (current_tag && is_opening_tag(tag)) {
-                // printf("Found nested opening tag\n");
-                // HTMLTag *new_tag = create_tag_from_string(tag);
+                printf("Found opening tag\n");
                 tag->parent = current_tag;
                 current_tag = tag;
-                printf("New current tag name: %s\n", current_tag->name);
             }
             // Non-closing tag
             else if (current_tag && is_non_closing_tag(tag)) {
-                add_child(current_tag, *tag);
+                printf("Found non-closing tag\n");
+                add_child(current_tag, tag);
             }
             // Closing tag
             else if (current_tag && is_closing_tag(tag)) {
@@ -786,21 +790,24 @@ HTMLTag *parse_tags(FILE *stream) {
                     if (current_tag->parent != NULL) {
                         // Allocating memory for the tag pair's content  
                         if (tag->content != NULL) {
-                            current_tag->content = (char*) malloc(sizeof(char) * (strlength(tag->content) + 1)); // +1 for null terminator
+                            current_tag->content = strdup(tag->content); // +1 for null terminator
 
                             if (!current_tag->content) {
                                 printf("Failed to allocate memory for tag's content\n");
                                 exit(1);
                             }
-
-                            strcpy(current_tag->content, tag->content);
                         }
 
+                        // We aren't using the closing tag anywhere, so we free it
+                        free_tag(tag);
 
-                        // Adding the open/close tag pair to the parent tag 
+                        // Adding the tag pair to the parent tag 
                         HTMLTag *parent = current_tag->parent;
-                        add_child(parent, *current_tag);
+                        add_child(parent, current_tag);
                         current_tag = parent;
+                    }
+                    else {
+                        free_tag(tag);
                     }
                 }
                 else {
@@ -808,11 +815,15 @@ HTMLTag *parse_tags(FILE *stream) {
                     exit(1);
                 }
             }
+            else {
+                free_tag(tag);
+            }
         }
 
         free(init_line_ptr);
     }
 
+    // Preview the HTML tags tree
     printf("\n\n\nHTML Preview:\n");
     print_all_tags(current_tag, 2);
     printf("\n\n");
@@ -820,10 +831,14 @@ HTMLTag *parse_tags(FILE *stream) {
     return current_tag;
 }
 
-json_object *json_create_attributes_array(Attribute *attrs, int attrs_length) {
+/*
+ * Creates an array of attribute objects and returns the pointer to the json object
+ */
+json_object *json_create_attributes_array(Attribute **attrs, int attrs_length) {
     json_object *json_attrs = json_object_new_array();
+
     for (int i = 0; i < attrs_length; i++) {
-        Attribute *attr = attrs + i;
+        Attribute *attr = *(attrs + i);
 
         json_object *json_attr = json_object_new_object();
         json_object_object_add(json_attr, "name", json_object_new_string(attr->name));
@@ -835,6 +850,9 @@ json_object *json_create_attributes_array(Attribute *attrs, int attrs_length) {
     return json_attrs;
 }
 
+/*
+ * Creates a HTMLTag json object and returns the pointer to it
+ */
 json_object *json_create_tag(HTMLTag *tag) {
     json_object *json_tag = json_object_new_object();
     json_object_object_add(json_tag, "name", json_object_new_string(tag->name));
@@ -843,17 +861,23 @@ json_object *json_create_tag(HTMLTag *tag) {
         json_object_object_add(json_tag, "content", json_object_new_string(tag->content));
 
     json_object_object_add(json_tag, "children_length", json_object_new_int(tag->children_length));
-    json_object_object_add(json_tag, "attributes", json_create_attributes_array(tag->attributes, tag->attribute_length));
+
+    if (tag->attribute_length > 0)
+        json_object_object_add(json_tag, "attributes", json_create_attributes_array(tag->attributes, tag->attribute_length));
+
     json_object_object_add(json_tag, "attribute_length", json_object_new_int(tag->attribute_length));
 
     return json_tag;
 }
 
+/*
+ * Recursively traverses root HTMLTag and its children creating json arrays containing respective nested HTMLTags
+ */
 void json_traverse_children_and_create_tags(HTMLTag *root, json_object *json_root, json_object *root_children) {
     bool add_children_array = root->children_length > 0;
 
     for (int i = 0; i < root->children_length; i++) {
-        HTMLTag *child = root->children + i;
+        HTMLTag *child = *(root->children + i);
         json_object *json_child = json_create_tag(child);
         json_object *child_children = json_object_new_array();
 
@@ -871,10 +895,8 @@ void json_traverse_children_and_create_tags(HTMLTag *root, json_object *json_roo
 }
 
 int main(void) {
-    // TODO: Fix memory leaks 
-    // TODO: Finish documenting the code
-    
     FILE *stream = open_file();
+    char *json_filename = "index.json";
 
     if (!stream) return 1;
 
@@ -891,12 +913,17 @@ int main(void) {
 
     json_object_array_add(tags, json_root_tag);
 
-    printf("Json representation: \n\n%s\n\n", json_object_to_json_string_ext(tags, JSON_C_TO_STRING_PRETTY));
+    // Save JSON to file
+    if (json_object_to_file_ext(json_filename, tags, JSON_C_TO_STRING_PRETTY)) {
+        printf("Failed to save JSON to %s\n", json_filename);
+    }
+    else {
+        printf("Saved JSON representation to %s\n", json_filename);
+    }
 
+    // Free and cleanup everything
     json_object_put(tags);
-
     free_tag(root_tag);
-
     fclose(stream);
 
     return 0;
